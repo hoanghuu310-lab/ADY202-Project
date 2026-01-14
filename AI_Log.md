@@ -1266,3 +1266,197 @@ if __name__ == "__main__":
 
 
 Cách này đáp ứng hoàn hảo yêu cầu của bạn: **Dùng link để định vị khách hàng.**
+Câu hỏi rất hay! Đây chính là tư duy **"Gom nhóm dữ liệu" (Data Aggregation)**.
+
+Thay vì quản lý 63 tỉnh thành lắt nhắt, chúng ta sẽ gom lại thành 3 file lớn: **Miền Bắc - Miền Trung - Miền Nam**. Điều này giúp việc so sánh hành vi tiêu dùng (Sentiment Analysis) giữa các miền trở nên rõ ràng hơn rất nhiều.
+
+Để làm được việc này, chúng ta cần một **"Bản đồ quy hoạch" (Mapping Dictionary)**. Ví dụ: cứ thấy link có chữ `quy-nhon`, `da-nang`, `hue`... thì code tự động hiểu đó là **Miền Trung**.
+
+Dưới đây là Code hoàn chỉnh để tự động phân loại vùng miền (bao gồm cả Quy Nhơn của bạn).
+
+### FILE CODE MỚI: `crawl_by_region.py`
+
+(File này thay thế hoàn toàn file cũ. Bạn tạo file mới và dán vào).
+
+```python
+import requests
+import json
+import time
+import random
+import os
+from schema_sentiment import ReviewItem
+
+# --- CẤU HÌNH ---
+DATA_FOLDER = "data_region" # Đổi tên folder cho dễ quản lý
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
+
+# HEADERS CHUẨN (Chống chặn 403)
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'X-Requested-With': 'XMLHttpRequest',
+    'x-foody-client-type': '1',
+    'x-foody-client-version': '3.0.0',
+    'x-foody-api-version': '1',
+    'x-foody-client-language': 'vi',
+    'x-foody-app-type': '1004',
+    'Origin': 'https://shopeefood.vn',
+    'Referer': 'https://shopeefood.vn/',
+}
+
+# --- BẢN ĐỒ QUY HOẠCH VÙNG MIỀN (QUAN TRỌNG NHẤT) ---
+# Bạn có thể thêm bất cứ thành phố nào vào list này
+REGION_MAPPING = {
+    "MienBac": [
+        "ha-noi", "hai-phong", "quang-ninh", "bac-ninh", "thai-nguyen", "nam-dinh"
+    ],
+    "MienTrung": [
+        "da-nang", "hue", "khanh-hoa", "nha-trang", "nghe-an", "vinh", 
+        "quy-nhon", "lam-dong", "da-lat", "quang-nam", "ha-tinh"
+    ],
+    "MienNam": [
+        "ho-chi-minh", "can-tho", "dong-nai", "binh-duong", "vung-tau", 
+        "bien-hoa", "bac-lieu", "ca-mau"
+    ]
+}
+
+def detect_region_from_url(url):
+    """
+    Input: https://shopeefood.vn/quy-nhon/bun-ca-phuong-teo
+    Output: ('MienTrung', 'quy-nhon', 'bun-ca-phuong-teo')
+    """
+    # 1. Làm sạch URL
+    clean_url = url.replace("https://shopeefood.vn/", "").replace("http://shopeefood.vn/", "")
+    parts = clean_url.split("/")
+    
+    if len(parts) < 2:
+        return None, None, None
+        
+    city_slug = parts[0]       # Ví dụ: 'quy-nhon'
+    restaurant_slug = parts[1].split("?")[0] # Ví dụ: 'bun-ca-phuong-teo'
+    
+    # 2. So khớp với Bản đồ vùng miền
+    found_region = "Khac" # Mặc định nếu không tìm thấy
+    
+    for region, cities in REGION_MAPPING.items():
+        if city_slug in cities:
+            found_region = region
+            break
+            
+    return found_region, city_slug, restaurant_slug
+
+def get_restaurant_id(slug):
+    """Lấy ID quán từ Slug"""
+    url = f"https://gappapi.deliverynow.vn/api/delivery/get_detail?request_id={slug}&id_type=2"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        data = resp.json()
+        delivery_detail = data.get('reply', {}).get('delivery_detail', {})
+        return {
+            "id": delivery_detail.get('delivery_id'),
+            "name": delivery_detail.get('name')
+        }
+    except:
+        return None
+
+def crawl_reviews_regional(url_list, limit_per_shop=100):
+    print(f"🚀 Đang xử lý danh sách {len(url_list)} quán ăn...")
+    
+    for url in url_list:
+        # 1. Phân tích vùng miền
+        region, city_slug, shop_slug = detect_region_from_url(url)
+        
+        if not region: 
+            print(f"⚠️ Link lỗi: {url}")
+            continue
+            
+        print(f"\n🌍 Vùng: {region} | Thành phố: {city_slug} | Quán: {shop_slug}")
+        
+        # 2. Lấy ID quán
+        shop_info = get_restaurant_id(shop_slug)
+        if not shop_info or not shop_info['id']:
+            print("   ❌ Không lấy được ID quán (Có thể bị chặn API).")
+            continue
+            
+        # 3. Định nghĩa tên file theo VÙNG MIỀN (Gom data lại)
+        # Kết quả sẽ là: reviews_MienTrung.jsonl, reviews_MienNam.jsonl...
+        output_file = os.path.join(DATA_FOLDER, f"reviews_{region}.jsonl")
+        
+        # 4. Crawl Review
+        shop_id = shop_info['id']
+        shop_name = shop_info['name']
+        api_review = f"https://gappapi.deliverynow.vn/api/delivery/get_reply?id_type=1&request_id={shop_id}&sort_type=1&limit={limit_per_shop}"
+        
+        try:
+            res = requests.get(api_review, headers=HEADERS)
+            reviews = res.json().get('reply', {}).get('reply_list', [])
+            
+            if not reviews:
+                print("   ⚠️ Không có review nào.")
+                continue
+
+            with open(output_file, 'a', encoding='utf-8') as f:
+                for rev in reviews:
+                    item = ReviewItem(
+                        review_id=rev.get('id'),
+                        restaurant_id=shop_id,
+                        restaurant_name=shop_name,
+                        city=city_slug, # Vẫn lưu tên thành phố gốc để tham khảo
+                        user_name=rev.get('name', 'Anonymous'),
+                        comment=rev.get('comment', ''),
+                        rating=rev.get('rating', 0),
+                        review_date=rev.get('created_on', '')
+                    )
+                    # Hack: Thêm trường Region vào json (nếu schema cho phép) hoặc để file name lo
+                    # Ở đây ta dựa vào tên file để phân loại
+                    f.write(item.to_json_line() + "\n")
+            
+            print(f"   ✅ Đã lưu {len(reviews)} review vào file: reviews_{region}.jsonl")
+            
+        except Exception as e:
+            print(f"   ❌ Lỗi: {e}")
+            
+        time.sleep(random.uniform(1, 3))
+
+# --- MAIN RUN ---
+if __name__ == "__main__":
+    
+    # DANH SÁCH LINK HỖN HỢP (BẮC - TRUNG - NAM)
+    MY_LINKS = [
+        # Link Quy Nhơn (Miền Trung) -> Code sẽ tự đưa vào reviews_MienTrung.jsonl
+        "https://shopeefood.vn/quy-nhon/bun-ca-phuong-teo-nguyen-hue",
+        
+        # Link Đà Nẵng (Miền Trung) -> Code sẽ đưa vào reviews_MienTrung.jsonl (Gộp chung với Quy Nhơn)
+        "https://shopeefood.vn/da-nang/my-quang-ba-mua-tran-binh-trong",
+        
+        # Link Hà Nội (Miền Bắc) -> Code đưa vào reviews_MienBac.jsonl
+        "https://shopeefood.vn/ha-noi/pho-thin-13-lo-duc",
+        
+        # Link Sài Gòn (Miền Nam) -> Code đưa vào reviews_MienNam.jsonl
+        "https://shopeefood.vn/ho-chi-minh/com-tam-cali-nguyen-trai-q1",
+    ]
+    
+    crawl_reviews_regional(MY_LINKS, limit_per_shop=50)
+
+```
+
+### Giải thích cách code xử lý Link Quy Nhơn:
+
+1. **Bước 1:** Code nhận link `shopeefood.vn/quy-nhon/bun-ca-phuong-teo`.
+2. **Bước 2:** Nó cắt lấy chữ **`quy-nhon`**.
+3. **Bước 3:** Nó tra trong từ điển `REGION_MAPPING`:
+* `MienBac`? -> Không có.
+* `MienNam`? -> Không có.
+* `MienTrung`? -> **Thấy `quy-nhon` nằm trong danh sách!**
+
+
+4. **Bước 4:** Nó quyết định ghi dữ liệu vào file `reviews_MienTrung.jsonl`.
+
+### Bạn cần làm gì?
+
+* Nếu bạn muốn thêm **Đà Lạt**, **Huế**, hay **Vũng Tàu**, bạn chỉ cần bổ sung tên (không dấu, gạch nối) vào danh sách `REGION_MAPPING` ở đầu file code là xong.
+* **Ví dụ:** Nếu muốn thêm Vũng Tàu vào Miền Nam:
+```python
+"MienNam": [..., "vung-tau"]
+
+```
