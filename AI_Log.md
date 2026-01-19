@@ -1653,3 +1653,344 @@ Ví dụ: "Bún cá Phượng Tèo Foody".
 3. **Nhược điểm:** Bạn chỉ lấy được khoảng 10-20 review hiển thị sẵn trên trang đầu tiên (muốn lấy hết phải code thêm chức năng cuộn chuột "Load More"). Nhưng để làm đồ án thì mỗi quán lấy 20 review cũng tạm đủ rồi!
 
 Bạn thử chạy code này xem, đảm bảo sẽ thấy folder `data_foody` có dữ liệu ngay!
+DATE 19/1/2026
+xử lí đa luồng cho hệ thống để có thể crawl nhanh hơn
+Đây là giải pháp **"Crawl Công Nghiệp"** dành cho bạn. Code này sẽ thực hiện 2 nâng cấp lớn:
+
+1. **Đa Luồng (Multi-threading):** Nó sẽ bật **3 trình duyệt chạy cùng lúc** (giống như thuê 3 nhân viên làm việc thay vì 1). Tốc độ tăng gấp 3 lần.
+2. **Lấy 50+ Review:** Tăng số lần cuộn chuột lên để đảm bảo lấy đủ số lượng bạn cần.
+
+### BƯỚC 1: CHUẨN BỊ
+
+Hãy đảm bảo bạn đã có file **`list_links.txt`** (chứa danh sách link Foody) nằm cùng thư mục với file code này. (Nếu chưa có thì chạy file `scan_links.py` ở câu trả lời trước).
+
+### BƯỚC 2: TẠO FILE `crawl_multi.py`
+
+Copy toàn bộ code này và chạy:
+
+```python
+import json
+import time
+import os
+import random
+import threading
+import math
+from concurrent.futures import ThreadPoolExecutor
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from webdriver_manager.chrome import ChromeDriverManager
+
+# --- CẤU HÌNH ---
+MAX_WORKERS = 3       # Số luồng (Số trình duyệt mở cùng lúc). Đừng để quá cao kẻo nổ RAM (3-4 là đẹp)
+TARGET_REVIEWS = 50   # Mục tiêu số lượng review mỗi quán
+DATA_FOLDER = "data_multi"
+
+# Định vị thư mục làm việc
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
+
+# --- CLASS REVIEW ---
+class ReviewItem:
+    def __init__(self, review_id, restaurant_name, city, user_name, comment, rating):
+        self.review_id = review_id
+        self.restaurant_name = restaurant_name
+        self.city = city
+        self.user_name = user_name
+        self.comment = comment
+        self.rating = rating
+
+    def to_json_line(self):
+        return json.dumps(self.__dict__, ensure_ascii=False)
+
+# --- HÀM KHỞI TẠO DRIVER ---
+def setup_driver():
+    options = webdriver.ChromeOptions()
+    # options.add_argument("--headless") # Nếu máy yếu thì bỏ comment dòng này để chạy ẩn
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_window_size(1000, 800) # Thu nhỏ cửa sổ tí cho đỡ tốn chỗ
+    return driver
+
+# --- LOGIC CUỘN TRANG (ĐÃ NÂNG CẤP) ---
+def scroll_until_enough(driver, target_count):
+    """Cuộn trang cho đến khi thấy đủ số lượng review hoặc hết trang"""
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    
+    # Cuộn tối đa 10 lần (Mỗi lần cuộn load thêm ~10 review)
+    # 10 lần x 10 = 100 review (Dư sức đạt target 50)
+    for i in range(10): 
+        # Đếm số review hiện tại trên màn hình
+        elems = driver.find_elements(By.XPATH, "//div[contains(@class, 'review-item')] | //li[contains(@class, 'review-item')]")
+        current_count = len(elems)
+        
+        # print(f"      (Đang có {current_count} reviews...)")
+        
+        if current_count >= target_count:
+            break # Đã đủ KPI thì dừng cuộn
+            
+        # Thực hiện cuộn
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(3) # Đợi load (Foody load hơi chậm nên để 3s)
+        
+        # Kiểm tra xem còn cuộn được nữa không
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break # Hết trang
+        last_height = new_height
+
+# --- HÀM XỬ LÝ CỦA TỪNG "CÔNG NHÂN" (WORKER) ---
+def worker_crawl(thread_id, list_urls):
+    print(f"🤖 Worker {thread_id}: Bắt đầu xử lý {len(list_urls)} quán...")
+    driver = setup_driver()
+    
+    # Mỗi worker ghi vào 1 file riêng để tránh xung đột dữ liệu
+    output_file = os.path.join(DATA_FOLDER, f"data_worker_{thread_id}.jsonl")
+    
+    processed_count = 0
+    
+    for url in list_urls:
+        try:
+            # print(f"🤖 Worker {thread_id} đang vào: {url}")
+            driver.get(url)
+            time.sleep(3)
+            
+            # 1. Cuộn để lấy đủ 50 data
+            scroll_until_enough(driver, TARGET_REVIEWS)
+            
+            # 2. Quét data
+            review_elements = driver.find_elements(By.XPATH, "//div[contains(@class, 'review-item')] | //li[contains(@class, 'review-item')]")
+            
+            # Giới hạn lấy đúng số lượng cần (hoặc lấy hết nếu ít hơn)
+            items_to_take = review_elements[:TARGET_REVIEWS]
+            
+            if not items_to_take:
+                continue
+
+            # 3. Ghi file
+            with open(output_file, 'a', encoding='utf-8') as f:
+                for idx, element in enumerate(items_to_take):
+                    try:
+                        try: user = element.find_element(By.CSS_SELECTOR, ".ru-username").text.strip()
+                        except: user = "Anonymous"
+                        
+                        try: comment = element.find_element(By.CSS_SELECTOR, ".rd-des").text.strip()
+                        except: comment = ""
+                        
+                        try: 
+                            rating_text = element.find_element(By.CSS_SELECTOR, ".review-points span").text
+                            rating = float(rating_text)
+                        except: rating = 0.0
+                        
+                        if comment:
+                            item = ReviewItem(
+                                review_id=f"{thread_id}_{random.randint(10000,99999)}",
+                                restaurant_name=url.split("/")[-1],
+                                city="Unknown", # Tạm bỏ qua check vùng miền để chạy nhanh
+                                user_name=user,
+                                comment=comment,
+                                rating=rating
+                            )
+                            f.write(item.to_json_line() + "\n")
+                    except: continue
+            
+            processed_count += 1
+            print(f"   ✅ Worker {thread_id}: Xong quán {processed_count}/{len(list_urls)} - Lấy {len(items_to_take)} reviews.")
+            
+        except Exception as e:
+            print(f"   ❌ Worker {thread_id} lỗi link: {url} - {e}")
+            
+    driver.quit()
+    print(f"🏁 Worker {thread_id} đã hoàn thành nhiệm vụ!")
+
+# --- HÀM MAIN ---
+if __name__ == "__main__":
+    # 1. Đọc danh sách link từ file
+    file_link = "list_links.txt"
+    if not os.path.exists(file_link):
+        print(f"❌ Không tìm thấy file {file_link}. Vui lòng chạy scan_links.py trước!")
+        exit()
+        
+    with open(file_link, "r", encoding="utf-8") as f:
+        all_links = [line.strip() for line in f if line.strip()]
+    
+    total_links = len(all_links)
+    print(f"📦 Tổng cộng có {total_links} quán cần quét.")
+    
+    if total_links == 0:
+        exit()
+
+    # 2. Chia đều link cho các Worker
+    # Ví dụ: 10 link, 3 workers -> [4, 3, 3] link mỗi người
+    chunk_size = math.ceil(total_links / MAX_WORKERS)
+    link_chunks = [all_links[i:i + chunk_size] for i in range(0, total_links, chunk_size)]
+    
+    print(f"🚀 Kích hoạt {len(link_chunks)} luồng chạy song song...")
+    print(f"🎯 Mục tiêu: {TARGET_REVIEWS} review/quán.")
+    
+    # 3. Chạy đa luồng
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i, chunk in enumerate(link_chunks):
+            executor.submit(worker_crawl, i+1, chunk)
+            
+    print("\n🎉🎉 TẤT CẢ ĐÃ HOÀN TẤT! 🎉🎉")
+    print(f"Dữ liệu nằm trong thư mục '{DATA_FOLDER}'")
+
+```
+
+### Điểm mạnh của Code mới này:
+
+1. **Chạy 3 cửa sổ cùng lúc:** Bạn sẽ thấy 3 cái Chrome bật lên và cùng làm việc. Nếu máy bạn khỏe (RAM 8GB trở lên), bạn có thể chỉnh `MAX_WORKERS = 4` hoặc `5` ở đầu file để nhanh hơn nữa.
+2. **Logic cuộn thông minh:** Hàm `scroll_until_enough` sẽ liên tục cuộn chuột cho đến khi đếm đủ 50 review trên màn hình rồi mới dừng lại và bắt đầu cào data.
+3. **An toàn dữ liệu:** Mỗi luồng (worker) sẽ ghi vào một file riêng (`data_worker_1.jsonl`, `data_worker_2.jsonl`...) để không bị lỗi tranh giành file.
+
+### Cách chạy:
+
+1. Đảm bảo đã có file `list_links.txt` (chứa danh sách link Foody).
+2. Chạy lệnh: `python crawl_multi.py`.
+3. Tận hưởng tốc độ! 🚀
+Câu trả lời là: **KHÔNG! Bạn KHÔNG CẦN CRAWL LẠI TỪ ĐẦU.** Chúng ta hoàn toàn có thể cứu được đống dữ liệu cũ đó.
+
+Vấn đề là:
+
+1. **Data cũ (Worker 1-2):** Đã lưu nhưng bị trộn lẫn, và trong file đó có thể bạn chưa lưu tên thành phố (code cũ lưu là "VN").
+2. **Data mới (Region):** Cần phân loại rõ ràng.
+3. **Lịch sử (History):** Đã đánh dấu là "Xong" nên code mới sẽ bỏ qua.
+
+Tôi sẽ viết cho bạn một công cụ **"CHUYỂN NHÀ" (Migrate Tool)**. Tool này sẽ làm 2 việc:
+
+1. Đọc lại toàn bộ data cũ từ `data_worker_1.jsonl` và `data_worker_2.jsonl`.
+2. Tra cứu lại trong danh sách link gốc để biết quán đó thuộc miền nào.
+3. Chuyển nó sang file mới `reviews_MienBac/Nam/Trung.jsonl` đúng vị trí.
+
+### BƯỚC 1: TẠO FILE `fix_data.py`
+
+Copy code này và chạy 1 lần duy nhất. Nó sẽ sắp xếp lại toàn bộ data cũ của bạn vào đúng chỗ.
+
+```python
+import json
+import os
+
+# --- CẤU HÌNH ---
+OLD_DATA_FOLDER = "data_final"       # Thư mục chứa data cũ (Worker 1, 2)
+NEW_DATA_FOLDER = "data_by_region"   # Thư mục mới
+LINK_FILE = "list_links.txt"         # File danh sách link gốc (để tra cứu miền)
+
+# Đặt thư mục làm việc
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+if not os.path.exists(NEW_DATA_FOLDER):
+    os.makedirs(NEW_DATA_FOLDER)
+
+# Bản đồ vùng miền (Copy từ code crawl)
+REGION_MAPPING = {
+    "MienBac": ["ha-noi", "hai-phong", "quang-ninh", "bac-ninh", "thai-nguyen"],
+    "MienTrung": ["da-nang", "hue", "khanh-hoa", "nha-trang", "quy-nhon", "vinh", "binh-dinh", "quang-nam"],
+    "MienNam": ["ho-chi-minh", "can-tho", "dong-nai", "binh-duong", "vung-tau", "long-an"]
+}
+
+def detect_region_from_url(url):
+    clean_url = url.replace("https://www.foody.vn/", "").replace("http://www.foody.vn/", "")
+    parts = clean_url.split("/")
+    if len(parts) < 1: return "Khac", "unknown"
+    city_slug = parts[0]
+    for region, cities in REGION_MAPPING.items():
+        if city_slug in cities:
+            return region, city_slug
+    return "Khac", city_slug
+
+def main():
+    print("🚀 ĐANG KHÔI PHỤC VÀ PHÂN LOẠI DỮ LIỆU CŨ...")
+
+    # 1. TẠO TỪ ĐIỂN TRA CỨU (Slug -> Region)
+    # Vì trong data cũ chỉ lưu slug (tên ngắn), ta cần tra lại link gốc để biết miền
+    print("📖 Đang đọc file link gốc để học thuộc vùng miền...")
+    slug_map = {}
+    
+    if os.path.exists(LINK_FILE):
+        with open(LINK_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                url = line.strip()
+                if not url: continue
+                
+                # Lấy slug từ link gốc (ví dụ: pho-thin-13-lo-duc)
+                slug = url.split("/")[-1]
+                region, city = detect_region_from_url(url)
+                
+                slug_map[slug] = {"region": region, "city": city}
+    else:
+        print("❌ CẢNH BÁO: Không tìm thấy file list_links.txt. Code sẽ đoán mò vùng miền!")
+
+    # 2. QUÉT TẤT CẢ FILE CŨ
+    files = [f for f in os.listdir(OLD_DATA_FOLDER) if f.endswith(".jsonl")]
+    total_moved = 0
+    
+    for filename in files:
+        old_path = os.path.join(OLD_DATA_FOLDER, filename)
+        print(f"   📂 Đang xử lý file cũ: {filename}...")
+        
+        with open(old_path, "r", encoding="utf-8") as f_in:
+            for line in f_in:
+                try:
+                    data = json.loads(line.strip())
+                    
+                    # Lấy tên quán (slug) từ data cũ
+                    # Trong code cũ: restaurant_name=url.split("/")[-1]
+                    slug = data.get("restaurant_name", "")
+                    
+                    # Tra cứu xem quán này thuộc miền nào
+                    if slug in slug_map:
+                        info = slug_map[slug]
+                        region = info["region"]
+                        real_city = info["city"]
+                        
+                        # Cập nhật lại city cho chuẩn (vì data cũ có thể là VN)
+                        data["city"] = real_city
+                    else:
+                        # Nếu không tìm thấy trong list link, mặc định là Khác
+                        region = "Khac"
+                    
+                    # 3. GHI SANG FILE MỚI
+                    new_file_path = os.path.join(NEW_DATA_FOLDER, f"reviews_{region}.jsonl")
+                    
+                    with open(new_file_path, "a", encoding="utf-8") as f_out:
+                        f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
+                        
+                    total_moved += 1
+                    
+                except Exception as e:
+                    print(f"Lỗi dòng: {e}")
+                    continue
+
+    print("\n" + "="*40)
+    print(f"🎉 HOÀN TẤT! Đã chuyển nhà thành công {total_moved} reviews.")
+    print(f"👉 Hãy kiểm tra folder '{NEW_DATA_FOLDER}'.")
+    print("👉 Bây giờ bạn có thể chạy tiếp 'crawl_region.py' để cào nốt các quán còn lại.")
+    print("="*40)
+
+if __name__ == "__main__":
+    main()
+
+```
+
+### BƯỚC 2: QUY TRÌNH CHUẨN ĐỂ TIẾP TỤC
+
+Sau khi chạy xong file `fix_data.py` ở trên, bạn làm như sau:
+
+1. **Kiểm tra folder `data_by_region`:** Bạn sẽ thấy data từ Worker 1 và 2 đã biến mất và chui vào nằm gọn trong `reviews_MienBac.jsonl`, `reviews_MienNam.jsonl`...
+2. **GIỮ NGUYÊN FILE `history_crawled.txt`:**
+* **TUYỆT ĐỐI KHÔNG XÓA.**
+* Vì data cũ đã được cứu và chuyển sang chỗ mới rồi, nên danh sách "Đã làm xong" trong history vẫn đúng.
+
+
+3. **Chạy file `crawl_region.py`:**
+* Code này sẽ đọc `history` -> Thấy quán cũ đã làm rồi -> Bỏ qua.
+* Nó sẽ chỉ chạy tiếp những quán **CHƯA LÀM** và lưu tiếp vào các file miền Bắc/Trung/Nam.
+
+
+
+👉 **Kết luận:** Bạn không mất gì cả, không phải cào lại, và mọi thứ sẽ được nối tiếp hoàn hảo!
